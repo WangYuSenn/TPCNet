@@ -1,0 +1,668 @@
+import math
+import numpy as np
+import torch
+import torchvision
+import os
+import torch.nn as nn
+from torch.nn.functional import interpolate
+import torch.nn.functional as F
+from backbone.ConvNext.convnext import convnext_base
+from backbone.MedMamba.MedMamba import SS_Conv_SSM, SS2D
+from thop import profile
+from torch import Tensor
+import sys
+from collections import OrderedDict
+import functools
+from timm.models.layers import DropPath, to_2tuple, trunc_normal_
+from typing import Optional, Callable
+from functools import partial
+from einops import rearrange, repeat
+
+
+class Classifier_Module(nn.Module):
+    def __init__(self, dilation_series, padding_series, NoLabels, input_channel):
+        super(Classifier_Module, self).__init__()
+        self.conv2d_list = nn.ModuleList()
+        for dilation, padding in zip(dilation_series, padding_series):
+            self.conv2d_list.append(
+                nn.Conv2d(input_channel, NoLabels, kernel_size=3, stride=1, padding=padding, dilation=dilation,
+                          bias=True))
+        for m in self.conv2d_list:
+            m.weight.data.normal_(0, 0.01)
+    def forward(self, x):
+        out = self.conv2d_list[0](x)
+        for i in range(len(self.conv2d_list) - 1):
+            out += self.conv2d_list[i + 1](x)
+        return out
+class ResidualConvUnit(nn.Module):
+    """Residual convolution module.
+    """
+
+    def __init__(self, features, out_dim):
+        """Init.
+        Args:
+            features (int): number of features
+        """
+        super().__init__()
+
+        self.conv1 = nn.Conv2d(
+            features, out_dim, kernel_size=3, stride=1, padding=1, bias=True
+        )
+        self.conv2 = nn.Conv2d(
+            out_dim, out_dim, kernel_size=3, stride=1, padding=1, bias=True
+        )
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        """Forward pass.
+        Args:
+            x (tensor): input
+        Returns:
+            tensor: output
+        """
+        out = self.relu(x)
+        out1 = self.conv1(out)
+        out = self.relu(out1)
+        out = self.conv2(out)
+        return out + out1
+class FeatureFusionBlock(nn.Module):
+    """Feature fusion block.
+    """
+
+    def __init__(self, features, out_dim):
+        """Init.
+        Args:
+            features (int): number of features
+        """
+        super(FeatureFusionBlock, self).__init__()
+
+        self.resConfUnit1 = ResidualConvUnit(features, out_dim)
+        self.resConfUnit2 = ResidualConvUnit(features, out_dim)
+
+    def forward(self, *xs):
+        """Forward pass.
+        Returns:
+            tensor: output
+        """
+        output = xs[0]
+        if len(xs) == 2:
+            output += self.resConfUnit1(xs[1])
+
+        output = self.resConfUnit2(output)
+        output = nn.functional.interpolate(
+            output, scale_factor=2, mode="bilinear", align_corners=True
+        )
+
+        return output
+class FeatureFusionBlock2(nn.Module):
+    """Feature fusion block.
+    """
+
+    def __init__(self, features, out_dim):
+        """Init.
+        Args:
+            features (int): number of features
+        """
+        super(FeatureFusionBlock2, self).__init__()
+
+        self.resConfUnit1 = ResidualConvUnit(features, features)
+        self.resConfUnit2 = ResidualConvUnit(features, out_dim)
+
+    def forward(self, *xs):
+        """Forward pass.
+        Returns:
+            tensor: output
+        """
+        output = xs[0]
+        if len(xs) == 2:
+            output += self.resConfUnit1(xs[1])
+
+        output = self.resConfUnit2(output)
+        output = nn.functional.interpolate(
+            output, scale_factor=2, mode="bilinear", align_corners=True
+        )
+
+        return output
+class Interpolate(nn.Module):
+    """Interpolation module.
+    """
+
+    def __init__(self, scale_factor, mode, align_corners=False):
+        """Init.
+        Args:
+            scale_factor (float): scaling
+            mode (str): interpolation mode
+        """
+        super(Interpolate, self).__init__()
+
+        self.interp = nn.functional.interpolate
+        self.scale_factor = scale_factor
+        self.mode = mode
+        self.align_corners = align_corners
+
+    def forward(self, x):
+        """Forward pass.
+        Args:
+            x (tensor): input
+        Returns:
+            tensor: interpolated data
+        """
+
+        x = self.interp(
+            x, scale_factor=self.scale_factor, mode=self.mode, align_corners=self.align_corners
+        )
+
+        return x
+
+class LowPass(nn.Module):
+    def __init__(self, infer_mode=False, res=14, dim=96, hidden_dim=96, **kwargs):
+        super().__init__()
+        self.res = res
+        self.dwconv = nn.Conv2d(dim, hidden_dim, kernel_size=3, padding=1)
+        self.hidden_dim = hidden_dim
+        self.linear = nn.Linear(hidden_dim, 2 * hidden_dim, bias=True)
+        self.out_norm = nn.LayerNorm(hidden_dim)
+        self.out_linear = nn.Linear(hidden_dim, hidden_dim, bias=True)
+        self.infer_mode = infer_mode
+        self.to_k = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim, bias=True),
+            nn.ReLU(),
+        )
+
+    def infer_init_heat2d(self, freq):
+        weight_exp = self.get_decay_map((self.res, self.res), device=freq.device)
+        self.k_exp = nn.Parameter(torch.pow(weight_exp[:, :, None], self.to_k(freq)), requires_grad=False)
+        del self.to_k
+
+    @staticmethod
+    def get_cos_map(N=224, device=torch.device("cpu"), dtype=torch.float):
+        weight_x = (torch.linspace(0, N - 1, N, device=device, dtype=dtype).view(1, -1) + 0.5) / N
+        weight_n = torch.linspace(0, N - 1, N, device=device, dtype=dtype).view(-1, 1)
+        weight = torch.cos(weight_n * weight_x * torch.pi) * math.sqrt(2 / N)
+        weight[0, :] = weight[0, :] / math.sqrt(2)
+        return weight
+
+
+    @staticmethod
+    def get_lowpass_filter(resolution=(224,224), cutoff_freq=0.5, device=torch.device("cpu"), dtype=torch.float):
+        resh, resw = resolution
+        weight_n = torch.linspace(0, torch.pi, resh + 1, device=device, dtype=dtype)[:resh].view(-1, 1)
+        weight_m = torch.linspace(0, torch.pi, resw + 1, device=device, dtype=dtype)[:resw].view(1, -1)
+        weight = torch.pow(weight_n, 2) + torch.pow(weight_m, 2)
+        weight = torch.exp(-weight / cutoff_freq)
+        return weight
+    def forward(self, x: torch.Tensor):
+        B, C, H, W = x.shape
+        x = self.dwconv(x)
+        if ((H, W) == getattr(self, "__RES__", (0, 0))) and (getattr(self, "__WEIGHT_COSN__", None).device == x.device):
+            # print('1111111111111111')
+            weight_cosn = getattr(self, "__WEIGHT_COSN__", None)
+            weight_cosm = getattr(self, "__WEIGHT_COSM__", None)
+            weight_exp = getattr(self, "__WEIGHT_EXP__", None)
+            weight_lowwpass = getattr(self, "__WEIGHT_LOWPASS__", None)
+            assert weight_cosn is not None
+            assert weight_cosm is not None
+            assert weight_exp is not None
+            assert weight_lowwpass is not None
+        else:
+            weight_cosn = self.get_cos_map(H, device=x.device).detach_()
+            weight_cosm = self.get_cos_map(W, device=x.device).detach_()
+            weight_lowwpass = self.get_lowpass_filter((H, W), device=x.device).detach_()
+            setattr(self, "__RES__", (H, W))
+            setattr(self, "__WEIGHT_COSN__", weight_cosn)
+            setattr(self, "__WEIGHT_COSM__", weight_cosm)
+            setattr(self, "__WEIGHT_LOWPASS__", weight_lowwpass)
+        N, M = weight_cosn.shape[0], weight_cosm.shape[0]
+        x = F.conv1d(x.contiguous().view(B, H, -1), weight_cosn.contiguous().view(N, H, 1))
+        x = F.conv1d(x.contiguous().view(-1, W, C), weight_cosm.contiguous().view(M, W, 1)).contiguous().view(B, N, M,-1)
+        weight_lowwpass = weight_lowwpass[:, :, None]
+        x = torch.einsum("bnmc,nmc -> bnmc", x, weight_lowwpass)
+        x = F.conv1d(x.contiguous().view(B, N, -1), weight_cosn.t().contiguous().view(H, N, 1))
+        x = F.conv1d(x.contiguous().view(-1, M, C), weight_cosm.t().contiguous().view(W, M, 1)).contiguous().view(B, H, W, -1)
+        x = self.out_norm(x)
+        x = x.permute(0, 3, 1, 2).contiguous()
+        return x
+class HighPass(nn.Module):
+    def __init__(self, infer_mode=False, res=14, dim=96, hidden_dim=96, **kwargs):
+        super().__init__()
+        self.res = res
+        self.dwconv = nn.Conv2d(dim, hidden_dim, kernel_size=3, padding=1)
+        self.hidden_dim = hidden_dim
+        self.linear = nn.Linear(hidden_dim, 2 * hidden_dim, bias=True)
+        self.out_norm = nn.LayerNorm(hidden_dim)
+        self.out_linear = nn.Linear(hidden_dim, hidden_dim, bias=True)
+        self.infer_mode = infer_mode
+        self.to_k = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim, bias=True),
+            nn.ReLU(),
+        )
+    def infer_init_heat2d(self, freq):
+        weight_exp = self.get_decay_map((self.res, self.res), device=freq.device)
+        self.k_exp = nn.Parameter(torch.pow(weight_exp[:, :, None], self.to_k(freq)), requires_grad=False)
+        del self.to_k
+
+    @staticmethod
+    def get_cos_map(N=224, device=torch.device("cpu"), dtype=torch.float):
+        weight_x = (torch.linspace(0, N - 1, N, device=device, dtype=dtype).view(1, -1) + 0.5) / N
+        weight_n = torch.linspace(0, N - 1, N, device=device, dtype=dtype).view(-1, 1)
+        weight = torch.cos(weight_n * weight_x * torch.pi) * math.sqrt(2 / N)
+        weight[0, :] = weight[0, :] / math.sqrt(2)
+        return weight
+
+
+    @staticmethod
+    def get_highpass_filter(resolution=(224,224), cutoff_freq=0.5, device=torch.device("cpu"), dtype=torch.float):
+        resh, resw = resolution
+        weight_n = torch.linspace(0, torch.pi, resh + 1, device=device, dtype=dtype)[:resh].view(-1, 1) # 线性等分向量
+        weight_m = torch.linspace(0, torch.pi, resw + 1, device=device, dtype=dtype)[:resw].view(1, -1)
+        # print('weight_m', weight_m)
+        weight = torch.pow(weight_n, 2) + torch.pow(weight_m, 2) # 计算平方
+        weight = -torch.exp(-weight / cutoff_freq)
+        return weight
+    def forward(self, x: torch.Tensor):
+        B, C, H, W = x.shape
+        x = self.dwconv(x)
+        if ((H, W) == getattr(self, "__RES__", (0, 0))) and (getattr(self, "__WEIGHT_COSN__", None).device == x.device):
+            # print('1111111111111111')
+            weight_cosn = getattr(self, "__WEIGHT_COSN__", None)
+            weight_cosm = getattr(self, "__WEIGHT_COSM__", None)
+            weight_exp = getattr(self, "__WEIGHT_EXP__", None)
+            weight_highpass = getattr(self, "__WEIGHT_HIGHPASS__", None)
+            assert weight_cosn is not None
+            assert weight_cosm is not None
+            assert weight_exp is not None
+            assert weight_highpass is not None
+        else:
+            weight_cosn = self.get_cos_map(H, device=x.device).detach_()
+            weight_cosm = self.get_cos_map(W, device=x.device).detach_()
+            weight_highpass = self.get_highpass_filter((H, W), device=x.device).detach_()
+            setattr(self, "__RES__", (H, W))
+            setattr(self, "__WEIGHT_COSN__", weight_cosn)
+            setattr(self, "__WEIGHT_COSM__", weight_cosm)
+            setattr(self, "__WEIGHT_HIGHPASS__", weight_highpass)
+        N, M = weight_cosn.shape[0], weight_cosm.shape[0]
+        x = F.conv1d(x.contiguous().view(B, H, -1), weight_cosn.contiguous().view(N, H, 1))
+        x = F.conv1d(x.contiguous().view(-1, W, C), weight_cosm.contiguous().view(M, W, 1)).contiguous().view(B, N, M,-1)
+        weight_highpass = weight_highpass[:, :, None]
+        x = torch.einsum("bnmc,nmc -> bnmc", x, weight_highpass)
+        x = F.conv1d(x.contiguous().view(B, N, -1), weight_cosn.t().contiguous().view(H, N, 1))
+        x = F.conv1d(x.contiguous().view(-1, M, C), weight_cosm.t().contiguous().view(W, M, 1)).contiguous().view(B, H, W, -1)
+        x = self.out_norm(x)
+        x = x.permute(0, 3, 1, 2).contiguous()
+        return x
+
+class ChannelWeights(nn.Module):
+    def __init__(self, dim, reduction=1):
+        super(ChannelWeights, self).__init__()
+        self.dim = dim
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+        self.mlp = nn.Sequential(
+            nn.Linear(self.dim * 4, self.dim * 4 // reduction),
+            nn.ReLU(inplace=True),
+            nn.Linear(self.dim * 4 // reduction, self.dim * 2),
+            nn.Sigmoid())
+
+    def forward(self, x1, x2):
+        B, _, H, W = x1.shape
+        x = torch.cat((x1, x2), dim=1)
+        avg = self.avg_pool(x).view(B, self.dim * 2)
+        max = self.max_pool(x).view(B, self.dim * 2)
+        y = torch.cat((avg, max), dim=1)  # B 4C
+        y = self.mlp(y).view(B, self.dim * 2, 1)
+        channel_weights = y.reshape(B, 2, self.dim, 1, 1).permute(1, 0, 2, 3, 4)  # 2 B C 1 1
+        return channel_weights
+
+
+class SpatialWeights(nn.Module):
+    def __init__(self, dim, reduction=1):
+        super(SpatialWeights, self).__init__()
+        self.dim = dim
+        self.mlp = nn.Sequential(
+            nn.Conv2d(self.dim * 2, self.dim // reduction, kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(self.dim // reduction, 2, kernel_size=1),
+            nn.Sigmoid())
+
+    def forward(self, x1, x2):
+        B, _, H, W = x1.shape
+        x = torch.cat((x1, x2), dim=1)  # B 2C H W
+        spatial_weights = self.mlp(x).reshape(B, 2, 1, H, W).permute(1, 0, 2, 3, 4)  # 2 B 1 H W
+        return spatial_weights
+
+
+class FeatureRectifyModule(nn.Module):
+    def __init__(self, dim, reduction=1, lambda_c=.5, lambda_s=.5):
+        super(FeatureRectifyModule, self).__init__()
+        self.lambda_c = lambda_c
+        self.lambda_s = lambda_s
+        self.channel_weights = ChannelWeights(dim=dim, reduction=reduction)
+        self.spatial_weights = SpatialWeights(dim=dim, reduction=reduction)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            trunc_normal_(m.weight, std=.02)
+            if isinstance(m, nn.Linear) and m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+        elif isinstance(m, nn.Conv2d):
+            fan_out = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
+            fan_out //= m.groups
+            m.weight.data.normal_(0, math.sqrt(2.0 / fan_out))
+            if m.bias is not None:
+                m.bias.data.zero_()
+
+    def forward(self, x1, x2):
+        channel_weights = self.channel_weights(x1, x2)
+        spatial_weights = self.spatial_weights(x1, x2)
+        out_x1 = x1 + self.lambda_c * channel_weights[1] * x2 + self.lambda_s * spatial_weights[1] * x2
+        out_x2 = x2 + self.lambda_c * channel_weights[0] * x1 + self.lambda_s * spatial_weights[0] * x1
+        return out_x1, out_x2
+
+    # Stage 1
+
+
+class CrossAttention(nn.Module):
+    def __init__(self, dim, num_heads=8, qkv_bias=False, qk_scale=None):
+        super(CrossAttention, self).__init__()
+        assert dim % num_heads == 0, f"dim {dim} should be divided by num_heads {num_heads}."
+
+        self.dim = dim
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.scale = qk_scale or head_dim ** -0.5
+        self.kv1 = nn.Linear(dim, dim * 2, bias=qkv_bias)
+        self.kv2 = nn.Linear(dim, dim * 2, bias=qkv_bias)
+
+    def forward(self, x1, x2):
+        B, N, C = x1.shape
+        q1 = x1.reshape(B, -1, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3).contiguous()
+        q2 = x2.reshape(B, -1, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3).contiguous()
+        k1, v1 = self.kv1(x1).reshape(B, -1, 2, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4).contiguous()
+        k2, v2 = self.kv2(x2).reshape(B, -1, 2, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4).contiguous()
+
+        ctx1 = (k1.transpose(-2, -1) @ v1) * self.scale
+        ctx1 = ctx1.softmax(dim=-2)
+        ctx2 = (k2.transpose(-2, -1) @ v2) * self.scale
+        ctx2 = ctx2.softmax(dim=-2)
+
+        x1 = (q1 @ ctx2).permute(0, 2, 1, 3).reshape(B, N, C).contiguous()
+        x2 = (q2 @ ctx1).permute(0, 2, 1, 3).reshape(B, N, C).contiguous()
+        out = x1 + x2
+        return out
+
+
+class CrossPath(nn.Module):
+    def __init__(self, dim, reduction=1, num_heads=None, norm_layer=nn.LayerNorm):
+        super().__init__()
+        self.channel_proj1 = nn.Linear(dim, dim // reduction * 2)
+        self.channel_proj2 = nn.Linear(dim, dim // reduction * 2)
+        self.act1 = nn.ReLU(inplace=True)
+        self.act2 = nn.ReLU(inplace=True)
+        self.cross_attn = CrossAttention(dim // reduction, num_heads=num_heads)
+        self.end_proj1 = nn.Linear(dim // reduction * 2, dim)
+        self.end_proj2 = nn.Linear(dim // reduction * 2, dim)
+        self.norm1 = norm_layer(dim)
+        self.norm2 = norm_layer(dim)
+
+    def forward(self, x1, x2):
+        y1, u1 = self.act1(self.channel_proj1(x1)).chunk(2, dim=-1)
+        # print('u1', u1.shape)
+        y2, u2 = self.act2(self.channel_proj2(x2)).chunk(2, dim=-1)
+        v1, v2 = self.cross_attn(u1, u2)
+        y1 = torch.cat((y1, v1), dim=-1)
+        y2 = torch.cat((y2, v2), dim=-1)
+        out_x1 = self.norm1(x1 + self.end_proj1(y1))
+        out_x2 = self.norm2(x2 + self.end_proj2(y2))
+        return out_x1, out_x2
+
+
+# Stage 2
+class ChannelEmbed(nn.Module):
+    def __init__(self, in_channels, out_channels, reduction=1, norm_layer=nn.BatchNorm2d):
+        super(ChannelEmbed, self).__init__()
+        self.out_channels = out_channels
+        self.residual = nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False)
+        self.channel_embed = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels // reduction, kernel_size=1, bias=True),
+            nn.Conv2d(out_channels // reduction, out_channels // reduction, kernel_size=3, stride=1, padding=1,
+                      bias=True, groups=out_channels // reduction),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_channels // reduction, out_channels, kernel_size=1, bias=True),
+            norm_layer(out_channels)
+        )
+        self.norm = norm_layer(out_channels)
+
+    def forward(self, x, H, W):
+        B, N, _C = x.shape
+        x = x.permute(0, 2, 1).reshape(B, _C, H, W).contiguous()
+        residual = self.residual(x)
+        x = self.channel_embed(x)
+        out = self.norm(residual + x)
+        return out
+
+
+class FeatureFusionModule(nn.Module):
+    def __init__(self, dim, reduction=1, num_heads=None, norm_layer=nn.BatchNorm2d):
+        super().__init__()
+        self.cross = CrossPath(dim=dim, reduction=reduction, num_heads=num_heads)
+        self.channel_emb = ChannelEmbed(in_channels=dim * 2, out_channels=dim, reduction=reduction,
+                                        norm_layer=norm_layer)
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            trunc_normal_(m.weight, std=.02)
+            if isinstance(m, nn.Linear) and m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+        elif isinstance(m, nn.Conv2d):
+            fan_out = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
+            fan_out //= m.groups
+            m.weight.data.normal_(0, math.sqrt(2.0 / fan_out))
+            if m.bias is not None:
+                m.bias.data.zero_()
+
+    def forward(self, x1, x2):
+        B, C, H, W = x1.shape
+        x1 = x1.flatten(2).transpose(1, 2)
+        x2 = x2.flatten(2).transpose(1, 2)
+        x1, x2 = self.cross(x1, x2)
+        merge = torch.cat((x1, x2), dim=-1)
+        merge = self.channel_emb(merge, H, W)
+
+        return merge
+
+
+
+class SelfAttention(nn.Module):
+    def __init__(self, dim, num_heads=8, qkv_bias=False, qk_scale=None):
+        super(SelfAttention, self).__init__()
+        assert dim % num_heads == 0, f"dim {dim} should be divided by num_heads {num_heads}."
+
+        self.dim = dim
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.scale = qk_scale or head_dim ** -0.5
+        self.kv1 = nn.Linear(dim, dim * 2, bias=qkv_bias)
+
+    def forward(self, x1):
+        B, N, C = x1.shape
+        q1 = x1.reshape(B, -1, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3).contiguous()
+        k1, v1 = self.kv1(x1).reshape(B, -1, 2, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4).contiguous()
+        ctx1 = (k1.transpose(-2, -1) @ v1) * self.scale
+        ctx1 = ctx1.softmax(dim=-2)
+
+        x11 = (q1 @ ctx1).permute(0, 2, 1, 3).reshape(B, N, C).contiguous()
+        out = x1 + x11
+        return out
+
+class CsAttention(nn.Module):
+    def __init__(self, dim, num_heads=8, qkv_bias=False, qk_scale=None):
+        super(CsAttention, self).__init__()
+        assert dim % num_heads == 0, f"dim {dim} should be divided by num_heads {num_heads}."
+
+        self.dim = dim
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.scale = qk_scale or head_dim ** -0.5
+        self.kv1 = nn.Linear(dim, dim * 2, bias=qkv_bias)
+        self.kv2 = nn.Linear(dim, dim * 2, bias=qkv_bias)
+
+    def forward(self, x1, x2):
+        B, N, C = x1.shape
+        q1 = x1.reshape(B, -1, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3).contiguous()
+        q2 = x2.reshape(B, -1, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3).contiguous()
+        k1, v1 = self.kv1(x1).reshape(B, -1, 2, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4).contiguous()
+        k2, v2 = self.kv2(x2).reshape(B, -1, 2, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4).contiguous()
+
+        ctx1 = (k1.transpose(-2, -1) @ v1) * self.scale
+        ctx1 = ctx1.softmax(dim=-2)
+        ctx2 = (k2.transpose(-2, -1) @ v2) * self.scale
+        ctx2 = ctx2.softmax(dim=-2)
+
+        x1 = (q1 @ ctx2).permute(0, 2, 1, 3).reshape(B, N, C).contiguous() + x1
+        x2 = (q2 @ ctx1).permute(0, 2, 1, 3).reshape(B, N, C).contiguous() + x2
+        out = x1 + x2
+        return out
+
+class AIM(nn.Module):
+    def __init__(self, in_dim, out_dim, n_heads=8, qkv_bias=False, dropout=0.):
+        super().__init__()
+        # self.ff = FeatureFusionModule(dim = out_dim, num_heads=n_heads)
+        self.dwconv = nn.Conv2d(in_dim, out_dim, kernel_size=3, padding=1)
+        self.ss2d = SS2D(d_model=out_dim)
+        self.satten = SelfAttention(dim = out_dim, num_heads=n_heads)
+        self.csatten = CrossAttention(dim = out_dim, num_heads=n_heads)
+    def forward(self, fv, p, fa):
+        p = self.dwconv(p)
+        bs, C, H, W = fv.size()
+
+
+        fv1 = fv.permute(0, 2, 3, 1).contiguous()
+        fv1 = self.ss2d(fv1)
+        fv1 = fv1.permute(0, 3, 1, 2).contiguous()
+        fv1 = fv1.flatten(2).transpose(1, 2)
+        fv = fv.flatten(2).transpose(1, 2)
+        fv2 = self.satten(fv)
+        fv = fv2 + fv1
+
+        p1 = p.permute(0, 2, 3, 1).contiguous()
+        p1 = self.ss2d(p1)
+        p1 = p1.permute(0, 3, 1, 2).contiguous()
+        p1 = p1.flatten(2).transpose(1, 2)
+
+        p = p.flatten(2).transpose(1, 2)
+        p2 = self.satten(p)
+        p = p2 + p1
+
+
+        aa = fa.unsqueeze(2).unsqueeze(3)
+        aa_use = aa.expand(-1, -1, H, W)
+        aa_use = aa_use.flatten(2).transpose(1, 2)
+        aa_use = self.satten(aa_use)
+
+        pafusion = self.csatten(fv, aa_use)
+        fafusion = self.csatten(p, aa_use)
+
+        fusion_map = pafusion + fafusion
+        fusion_map = fusion_map.permute(0, 2, 1).reshape(bs, C, H, W).contiguous()
+
+        return fusion_map
+
+
+
+
+
+class BasicConv2d(nn.Module):
+    def __init__(self, in_planes, out_planes, kernel_size, stride, padding, bias=False):
+        super(BasicConv2d, self).__init__()
+        self.conv = nn.Conv2d(in_planes, out_planes,
+                              kernel_size=kernel_size, stride=stride,
+                              padding=padding, bias=bias)
+        self.bn = nn.BatchNorm2d(out_planes)
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.bn(x)
+        x = self.relu(x)
+        return x
+
+
+class BackPrompt(nn.Module):
+    def __init__(self, in_dim, out_dim, reduction_ratio=16):
+        super(BackPrompt, self).__init__()
+        self.lowpass = LowPass(dim=in_dim, hidden_dim=out_dim)
+        self.highpass = HighPass(dim=in_dim, hidden_dim=out_dim)
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc1 = nn.Sequential(
+            nn.Linear(out_dim*2, out_dim // reduction_ratio, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(out_dim // reduction_ratio, out_dim*2, bias=False),
+            nn.Sigmoid()
+        )
+    def forward(self, v, p):
+        low = self.lowpass(p)
+        high = self.highpass(p)
+        fused = torch.cat([low, high], dim=1)
+        b, c, _, _ = fused.size()
+        avg_f = self.avg_pool(fused).view(b, c)
+        weights = self.fc1(avg_f).view(b, c, 1, 1)
+        low_weight, high_weight = torch.split(weights, c//2, dim=1)
+        out = v * low_weight + v * high_weight
+        return out
+
+
+
+
+class Pred_endecoder(nn.Module):
+    def __init__(self):
+        super(Pred_endecoder, self).__init__()
+        self.backbone = convnext_base(pretrained=True)
+        self.output_conv = nn.Sequential(
+            nn.Conv2d(64, 32, kernel_size=3, stride=1, padding=1),
+            Interpolate(scale_factor=2, mode="bilinear"),
+            nn.Conv2d(32, 1, kernel_size=1, stride=1, padding=0),
+        )
+        self.sig = nn.Sigmoid()
+        self.audio_align1 = nn.Linear(128, 128)
+        self.audio_align2 = nn.Linear(128, 256)
+        self.audio_align3 = nn.Linear(128, 512)
+        self.audio_align4 = nn.Linear(128, 1024)
+        self.backp1 = BackPrompt(in_dim=64, out_dim=128)
+        self.backp2 = BackPrompt(in_dim=128, out_dim=256)
+        self.backp3 = BackPrompt(in_dim=320, out_dim=512)
+        self.backp4 = BackPrompt(in_dim=512, out_dim=1024)
+        self.aim1 = AIM(in_dim=64, out_dim=128)
+        self.aim2 = AIM(in_dim=128, out_dim=256)
+        self.aim3 = AIM(in_dim=320, out_dim=512)
+        self.aim4 = AIM(in_dim=512, out_dim=1024)
+        self.path4 = FeatureFusionBlock(1024, 512)
+        self.path3 = FeatureFusionBlock2(512, 256)
+        self.path2 = FeatureFusionBlock2(256, 128)
+        self.path1 = FeatureFusionBlock2(128, 64)
+    def forward(self, video, pvt, audio_feat):
+        video = self.backbone(video)
+        audio1 = self.audio_align1(audio_feat)
+        audio2 = self.audio_align2(audio_feat)
+        audio3 = self.audio_align3(audio_feat)
+        audio4 = self.audio_align4(audio_feat)
+        vp1 = self.backp1(video[0], pvt[0])
+        vp2 = self.backp2(video[1], pvt[1])
+        vp3 = self.backp3(video[2], pvt[2])
+        vp4 = self.backp4(video[3], pvt[3])
+        vpa1 = self.aim1(vp1, pvt[0], audio1)
+        vpa2 = self.aim2(vp2, pvt[1], audio2)
+        vpa3 = self.aim3(vp3, pvt[2], audio3)
+        vpa4 = self.aim4(vp4, pvt[3], audio4)
+        conv4_feat = self.path4(vpa4)  # BF x 256 x 14 x 14
+        conv43 = self.path3(conv4_feat, vpa3)  # BF x 256 x 28 x 28
+        conv432 = self.path2(conv43, vpa2)  # BF x 256 x 56 x 56
+        conv4321 = self.path1(conv432, vpa1)  # BF x 256 x 112 x 112
+        pred = self.output_conv(conv4321)  # BF x 1 x 224 x 224
+        return pred
