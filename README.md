@@ -7,4 +7,4 @@ Python 3.11+, Pytorch 1.13.1+, Cuda 11.7+, opencv-python If anything goes wrong 
 # Results
 ![image](https://github.com/user-attachments/assets/ccf118d0-e5a4-4ebb-9f87-42c6d6979fa0)
 # Data Preparation
-数据集： [数据集链接]([https://pan.baidu.com/s/1XrDpcsRAHAXRT4HQik0prA?pwd=YS98](http://www.avlbench.opennlplab.cn/download))
+数据集： [数据集链接](http://www.avlbench.opennlplab.cn/download)
